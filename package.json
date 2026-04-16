@@ -30,7 +30,6 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "lint": "eslint src/",
-    "prepare": "npm run build",
     "test": "npm run build && node dist/server/test.js --retry-tests",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist"

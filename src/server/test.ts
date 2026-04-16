@@ -11,11 +11,19 @@ import type {
   AdapterEnvironmentCheck,
 } from "@paperclipai/adapter-utils";
 
+import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
+import {
+  HERMES_RETRY_DELAYS_MS,
+  getRetryableHermesStatusCode,
+  runHermesCommandWithRetries,
+} from "./execute.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -291,4 +299,135 @@ export async function testEnvironment(
     checks,
     testedAt: new Date().toISOString(),
   };
+}
+
+type RetryHarnessResult = Awaited<ReturnType<typeof runHermesCommandWithRetries>>;
+
+function createExecutionResult(overrides: Partial<RetryHarnessResult> = {}): RetryHarnessResult {
+  return {
+    exitCode: 1,
+    pid: null,
+    signal: null,
+    startedAt: null,
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    ...overrides,
+  };
+}
+
+async function verifyRetrySuccessPath(): Promise<void> {
+  const firstFailure = createExecutionResult({
+    stderr: "HTTP 529 overloaded_error from https://api.minimax.io/anthropic",
+  });
+  const eventualSuccess = createExecutionResult({
+    exitCode: 0,
+    stdout: "Recovered response\nsession_id: retry-success",
+  });
+  const queue = [firstFailure, eventualSuccess];
+  const sleepCalls: number[] = [];
+  const logs: string[] = [];
+
+  const result = await runHermesCommandWithRetries({
+    run: async () => {
+      const next = queue.shift();
+      assert.ok(next, "retry-success queue should still have a result");
+      return next;
+    },
+    onRetryLog: (message) => {
+      logs.push(message);
+    },
+    sleep: async (ms) => {
+      sleepCalls.push(ms);
+    },
+  });
+
+  assert.strictEqual(result, eventualSuccess);
+  assert.deepStrictEqual(sleepCalls, [HERMES_RETRY_DELAYS_MS[0]]);
+  assert.strictEqual(logs.length, 1);
+  assert.match(logs[0], /HTTP 529/);
+  assert.match(logs[0], /Retry 1\/3/);
+}
+
+async function verifyRetryExhaustedPath(): Promise<void> {
+  const firstFailure = createExecutionResult({
+    stderr: "provider error: HTTP 503 Service Unavailable",
+  });
+  const secondFailure = createExecutionResult({
+    stderr: "status code 503 from provider",
+  });
+  const thirdFailure = createExecutionResult({
+    stderr: "{\"status\":503,\"error\":\"overloaded_error\"}",
+  });
+  const finalFailure = createExecutionResult({
+    stderr: "HTTP 503 overloaded_error persisted after final attempt",
+  });
+  const queue = [firstFailure, secondFailure, thirdFailure, finalFailure];
+  const sleepCalls: number[] = [];
+  const logs: string[] = [];
+
+  const result = await runHermesCommandWithRetries({
+    run: async () => {
+      const next = queue.shift();
+      assert.ok(next, "retry-exhausted queue should still have a result");
+      return next;
+    },
+    onRetryLog: (message) => {
+      logs.push(message);
+    },
+    sleep: async (ms) => {
+      sleepCalls.push(ms);
+    },
+  });
+
+  assert.strictEqual(result, finalFailure);
+  assert.deepStrictEqual(sleepCalls, [...HERMES_RETRY_DELAYS_MS]);
+  assert.strictEqual(logs.length, 4);
+  assert.match(logs[0], /Retry 1\/3/);
+  assert.match(logs[1], /Retry 2\/3/);
+  assert.match(logs[2], /Retry 3\/3/);
+  assert.match(logs[3], /persisted after 3 retries/i);
+}
+
+function verifyRetryStatusDetection(): void {
+  assert.strictEqual(
+    getRetryableHermesStatusCode(createExecutionResult({
+      stderr: "HTTP 529 overloaded_error from provider",
+    })),
+    529,
+  );
+  assert.strictEqual(
+    getRetryableHermesStatusCode(createExecutionResult({
+      stderr: "response status code 503",
+    })),
+    503,
+  );
+  assert.strictEqual(
+    getRetryableHermesStatusCode(createExecutionResult({
+      exitCode: 0,
+      stdout: "The model mentioned 503 creatives, but the run succeeded.",
+    })),
+    null,
+  );
+}
+
+async function runRetryHarness(): Promise<void> {
+  verifyRetryStatusDetection();
+  await verifyRetrySuccessPath();
+  await verifyRetryExhaustedPath();
+  process.stdout.write("[retry-tests] passed\n");
+}
+
+function isDirectExecution(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  return path.resolve(entry) === fileURLToPath(import.meta.url);
+}
+
+if (isDirectExecution() && process.argv.includes("--retry-tests")) {
+  runRetryHarness().catch((error) => {
+    const message = error instanceof Error ? error.stack ?? error.message : String(error);
+    process.stderr.write(`[retry-tests] failed\n${message}\n`);
+    process.exitCode = 1;
+  });
 }

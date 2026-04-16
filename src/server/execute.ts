@@ -213,6 +213,18 @@ interface ParsedOutput {
   errorMessage?: string;
 }
 
+type ChildProcessResult = Awaited<ReturnType<typeof runChildProcess>>;
+type RetryableStatusCode = 503 | 529;
+
+export const HERMES_RETRY_DELAYS_MS = [2_000, 4_000, 8_000] as const;
+
+const RETRYABLE_STATUS_REGEXES = [
+  /\bHTTP(?:\/\d+(?:\.\d+)?)?(?:\s+status)?\D*(529|503)\b/i,
+  /\bstatus(?:\s+code)?\D*(529|503)\b/i,
+  /\boverloaded_error\b[\s\S]*?\b(529|503)\b/i,
+  /\b(529|503)\b[\s\S]*?\boverloaded_error\b/i,
+] as const;
+
 // ---------------------------------------------------------------------------
 // Response cleaning
 // ---------------------------------------------------------------------------
@@ -300,6 +312,77 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     if (errorLines.length > 0) {
       result.errorMessage = errorLines.slice(0, 5).join("\n");
     }
+  }
+
+  return result;
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractRetryableStatusCode(text: string): RetryableStatusCode | null {
+  for (const regex of RETRYABLE_STATUS_REGEXES) {
+    const match = text.match(regex);
+    if (match?.[1] === "503" || match?.[1] === "529") {
+      return Number.parseInt(match[1], 10) as RetryableStatusCode;
+    }
+  }
+  return null;
+}
+
+export function getRetryableHermesStatusCode(
+  result: Pick<ChildProcessResult, "exitCode" | "signal" | "timedOut" | "stdout" | "stderr">,
+): RetryableStatusCode | null {
+  const failed =
+    Boolean(result.timedOut) ||
+    Boolean(result.signal) ||
+    (result.exitCode ?? 0) !== 0;
+  if (!failed) return null;
+
+  const combined = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
+  if (!combined) return null;
+
+  return extractRetryableStatusCode(combined);
+}
+
+interface HermesRetryOptions {
+  run: () => Promise<ChildProcessResult>;
+  onRetryLog?: (message: string) => Promise<void> | void;
+  sleep?: (ms: number) => Promise<void> | void;
+  retryDelaysMs?: readonly number[];
+}
+
+export async function runHermesCommandWithRetries(
+  options: HermesRetryOptions,
+): Promise<ChildProcessResult> {
+  const {
+    run,
+    onRetryLog = () => undefined,
+    sleep = wait,
+    retryDelaysMs = HERMES_RETRY_DELAYS_MS,
+  } = options;
+
+  let result = await run();
+
+  for (let retryIndex = 0; retryIndex < retryDelaysMs.length; retryIndex += 1) {
+    const statusCode = getRetryableHermesStatusCode(result);
+    if (!statusCode) return result;
+
+    const delayMs = retryDelaysMs[retryIndex];
+    const attempt = retryIndex + 1;
+    await onRetryLog(
+      `[hermes] Retryable provider failure detected (HTTP ${statusCode}). Retry ${attempt}/${retryDelaysMs.length} in ${Math.round(delayMs / 1000)}s.\n`,
+    );
+    await sleep(delayMs);
+    result = await run();
+  }
+
+  const exhaustedStatusCode = getRetryableHermesStatusCode(result);
+  if (exhaustedStatusCode) {
+    await onRetryLog(
+      `[hermes] Retryable provider failure persisted after ${retryDelaysMs.length} retries (last status HTTP ${exhaustedStatusCode}). Surfacing final failure.\n`,
+    );
   }
 
   return result;
@@ -470,12 +553,15 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
-  const result = await runChildProcess(ctx.runId, hermesCmd, args, {
-    cwd,
-    env,
-    timeoutSec,
-    graceSec,
-    onLog: wrappedOnLog,
+  const result = await runHermesCommandWithRetries({
+    run: () => runChildProcess(ctx.runId, hermesCmd, args, {
+      cwd,
+      env,
+      timeoutSec,
+      graceSec,
+      onLog: wrappedOnLog,
+    }),
+    onRetryLog: (message) => ctx.onLog("stdout", message),
   });
 
   // ── Parse output ───────────────────────────────────────────────────────
